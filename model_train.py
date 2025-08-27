@@ -12,7 +12,6 @@ from torch.optim.lr_scheduler import LambdaLR
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 
-
 # Warmup + CosinAnnealing
 def build_cosine_with_warmup(optimizer, total_steps, warmup_ratio=0.1, min_lr_scale=0.2):
     warmup_steps = max(1, int(total_steps * warmup_ratio))
@@ -71,7 +70,11 @@ def train_iters(
     dec_sch = build_cosine_with_warmup(dec_opt, total_steps=total_train_steps, warmup_ratio=warmup_ratio)
 
     pad_tgt = 2
-    criterion = nn.NLLLoss(ignore_index=pad_tgt)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_tgt)
+    """
+    正确类的概率 = 1 - ε（例如 0.9,当 ε=0.1 时）
+    其他类的概率 = ε / (num_classes - 1)（平均分配)
+    """
 
     # ==== 日志与计时 ====
     run_dir = model_save_dir
@@ -99,7 +102,9 @@ def train_iters(
         epoch_start = time.time()
 
         # ——混合跨桶迭代：把四个 DataLoader 的 batch 随机交织
-        for src_batch, tgt_batch  in mixed_bucket_iterator(train_loaders):
+        for src_batch, tgt_batch in mixed_bucket_iterator(train_loaders):
+            
+            # Transfer batch_data to cuda
             src_batch = src_batch.to(device)
             tgt_batch = tgt_batch.to(device)
             loss = agent.train_on_batch(src_batch, tgt_batch, enc_opt, dec_opt, criterion, teacher_forcing_ratio=0.5)
@@ -188,10 +193,10 @@ def train_iters(
 # Set device to CUDA if available, otherwise use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Use calculate device: ", device, "\n")
-MAX_LENGTH = 30 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
+MAX_LENGTH = 20 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
 print(f"Training data limit length (including punctuation marks): {MAX_LENGTH}")
 
-# data_path = "./dataset/rus.txt"
+data_path = "./dataset/rus.txt"
 eval_ratio = 0.15
 hidden_size = 1024
 batch_size = 512
@@ -209,37 +214,60 @@ if __name__ == "__main__":
     dict_obj.AddData(data, MAX_LENGTH=MAX_LENGTH, reverse=False)
     dict_obj.save_tokenizer()
     
+    
     # 这里的数据和Lang对象在训练正反翻译器的时候是可复用的，我们只实现一次dictionary类
     language1 = dict_obj.lang_class1
     language2 = dict_obj.lang_class2
-    pairs_all = dict_obj.data_pairs
+    vocab_size1 = language1.n_words
+    vocab_size2 = language2.n_words
     
-    train_pairs, eval_pairs = train_eval_split(pairs_all, MAX_LENGTH_no_specials=MAX_LENGTH, eval_ratio=eval_ratio, seed=2025)
+    train_pairs, eval_pairs = train_eval_split(dict_obj.data_pairs, MAX_LENGTH_no_specials=MAX_LENGTH, eval_ratio=eval_ratio)
     
-    # 2) 正向 loaders（lang1 -> lang2）
+    # Rlease memory
+    del dict_obj
+    import gc
+    gc.collect()
+    
+    
+    agent_f = translator(
+            src_vocab_size=vocab_size1,
+            tgt_vocab_size=vocab_size2,
+            hidden_size=hidden_size,
+            device="cpu",
+            num_encoder_layers=2, 
+            num_decoder_layers=1,
+            dropout_rate= 0.1,
+            sos_idx=language1.word2index["<SOS>"],
+            eos_idx=language2.word2index["<EOS>"],
+            padding_idx=language2.word2index["<PAD>"])
+    agent_f.to(device)
+    
+    # agent_b = translator(
+    #             src_vocab_size=vocab_size2,
+    #             tgt_vocab_size=vocab_size1,
+    #             hidden_size=hidden_size,
+    #             device="cuda",
+    #             num_encoder_layers=2, 
+    #             num_decoder_layers=1,
+    #             dropout_rate= 0.1,
+    #             sos_idx=language2.word2index["SOS"],
+    #             eos_idx=language1.word2index["EOS"])
+    
+
+    
+    
+    
+    # 正向 loaders（lang1 -> lang2）# Attention! Here load data on cpu to save cuda memory
     train_loaders_f = build_bucket_dataloaders(
         train_pairs, language1, language2, MAX_LENGTH_no_specials=MAX_LENGTH,
         include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},
-        shuffle=True, pin_memory=(device.type=="cuda")
+        shuffle=True, pin_memory=(device.type=="cpu")
     )
     eval_loaders_f = build_bucket_dataloaders(
         eval_pairs, language1, language2, MAX_LENGTH_no_specials=MAX_LENGTH,
         include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},  # eval可更大
-        shuffle=False, pin_memory=(device.type=="cuda")
+        shuffle=False, pin_memory=(device.type=="cpu")
     )
-
-    agent_f = translator(
-                src_vocab_size=dict_obj.lang_class1.n_words,
-                tgt_vocab_size=dict_obj.lang_class2.n_words,
-                hidden_size=hidden_size,
-                device="cuda",
-                num_encoder_layers=2, 
-                num_decoder_layers=1,
-                dropout_rate= 0.1,
-                sos_idx=dict_obj.lang_class1.word2index["<SOS>"],
-                eos_idx=dict_obj.lang_class1.word2index["<EOS>"])
-
-
 
     # # 3) 反向 loaders（lang2 -> lang1），同一套字典可直接用
     # train_loaders_b = build_bucket_dataloaders(
@@ -253,29 +281,19 @@ if __name__ == "__main__":
     #     shuffle=False, pin_memory=(device.type=="cuda")
     # )
                      
-    # agent_b = translator(
-    #             src_vocab_size=dict_obj.lang_class2.n_words,
-    #             tgt_vocab_size=dict_obj.lang_class1.n_words,
-    #             hidden_size=hidden_size,
-    #             device="cuda",
-    #             num_encoder_layers=2, 
-    #             num_decoder_layers=1,
-    #             dropout_rate= 0.1,
-    #             sos_idx=dict_obj.lang_class1.word2index["SOS"],
-    #             eos_idx=dict_obj.lang_class1.word2index["EOS"])
-    
+   
     history, run_dir = train_iters(
         agent=agent_f,
         train_loaders=train_loaders_f,
         eval_loaders=eval_loaders_f,
         # upper three need change direction!!
         device=device,
-        epochs=10,
+        epochs=8,
         lr=3e-4,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        print_every=50,
-        val_every=500,
+        print_every=100,
+        val_every=1000,
         model_save_dir=save_dir
     )
     

@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.utils as nn_utils
 
 # 构建编码器 - 批量序列全部输入 
 # input, hidden: (batch, seq_len),（num_layers * num_directions, batch, hidden_size）  
@@ -12,21 +13,17 @@ import torch.nn.functional as F
 class Norm_GRU(nn.Module):
     def __init__(self, 
                  hidden_size, # 隐藏层维度
-                 device
                  ):
         super().__init__()
         self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
         self.ln_out = nn.LayerNorm(hidden_size)
         self.ln_hidden = nn.LayerNorm(hidden_size)
-        self.to(device)
         
     def forward(self, input, hidden):
         output, hidden = self.gru(input, hidden)
         output = self.ln_out(output)
         hidden = self.ln_hidden(hidden)
         return output, hidden
-        
-        
         
         
 class   EncoderRNN(nn.Module):
@@ -36,6 +33,7 @@ class   EncoderRNN(nn.Module):
                  hidden_size, # 隐藏层维度
                  device,
                  num_encoder_layers = 1, # 采用编码器的GRU层数
+                 padding_index = 2,
                  ):
         super(EncoderRNN, self).__init__()
 
@@ -44,13 +42,22 @@ class   EncoderRNN(nn.Module):
         self.hidden_size = hidden_size
         self.num_encoder_layers = num_encoder_layers
 
-        self.embedding = nn.Embedding(input_size, hidden_size)  # 定义嵌入层，输入one_hot词编号 -> 输出连续词向量
+        self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=padding_index)  # 定义嵌入层，输入one_hot词编号 -> 输出连续词向量
         
-        self.grus = nn.ModuleList([Norm_GRU(hidden_size, device=device) for _ in range(num_encoder_layers)])
+        self.grus = nn.ModuleList([Norm_GRU(hidden_size) for _ in range(num_encoder_layers)])
         
         self.fc = nn.Linear(hidden_size, hidden_size)
         
         self.to(self.device)
+        self.model_half = False
+
+    def to(self, device):
+        self.device = device
+        return super().to(device)
+    
+    def half(self):
+        self.model_half=True
+        return super().half()
 
     # 定义向前传播
     def forward(self, input, hidden=None):
@@ -80,7 +87,10 @@ class   EncoderRNN(nn.Module):
         return output, hidden  # (seq_len, batch, input_size), （batch, hidden_size）
 
     def initHidden(self, batch_size=1):
-        return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device)
+        if self.model_half:
+            return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device).half()
+        else:
+            return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device)
     
 
 class Attention(nn.Module):
@@ -146,6 +156,7 @@ class AttnDecoderRNN(nn.Module):
             output_size,
             device, 
             num_decoder_layers = 1, # 解码器的GRU层数``
+            padding_index = 2,
             dropout_rate=0.1, 
             ):
         super(AttnDecoderRNN, self).__init__()
@@ -155,18 +166,27 @@ class AttnDecoderRNN(nn.Module):
         self.num_decoder_layers = num_decoder_layers
         self.output_size = output_size
         self.dropout_rate = dropout_rate
-        self.embedding = nn.Embedding(self.output_size, self.hidden_size)  
+        self.embedding = nn.Embedding(self.output_size, self.hidden_size, padding_idx=padding_index)  
         self.attention_emb = Attention(self.hidden_size)
         self.attention_enc = Attention(self.hidden_size)
         # 行代码定义了另一个线性层，用于将当前GRU的输出和通过注意力机制加权后的编码器输出结合起来。
         self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.grus = nn.ModuleList([Norm_GRU(self.hidden_size, device=self.device) for _ in range(self.num_decoder_layers)])
+        self.grus = nn.ModuleList([Norm_GRU(self.hidden_size) for _ in range(self.num_decoder_layers)])
         self.ln_embedding = nn.LayerNorm(self.hidden_size)
         self.ln_out =  nn.LayerNorm(self.hidden_size)
         self.out = nn.Linear(self.hidden_size, self.output_size)
         self.embedding_list = []
         self.to(self.device)
+        self.model_half=False
+        
+    def to(self, device):
+        self.device = device
+        return super().to(device)
+    
+    def half(self):
+        self.model_half=True
+        return super().half()
 
     def forward(self, input, encoder_output, hidden=None):
         batch_size = encoder_output.size(1)
@@ -174,7 +194,7 @@ class AttnDecoderRNN(nn.Module):
             hidden = self.initHidden(batch_size)
             
         embedded = self.embedding(input)  # (batch, 1, hidden_size)
-        embedded = embedded.permute(1, 0, 2).to(self.device)  # (1, batch_size, hidden_size)
+        embedded = embedded.permute(1, 0, 2) # (1, batch_size, hidden_size)
         
         self.embedding_list.append(embedded)
         embedding_mat = torch.cat(self.embedding_list, dim=0)
@@ -201,13 +221,16 @@ class AttnDecoderRNN(nn.Module):
 
         hidden = torch.cat(new_h_list, dim=0)  
         output = self.dropout(x)  # (1, batch，hidden_size)
-        output = F.log_softmax(self.out(output), dim=2)  # -> (1, batch，num_words)
+        output = self.out(output)  # -> (1, batch，hidden_size)
 
         return output, hidden, attn_emb, attn_enc
         
 
     def initHidden(self, batch_size=1):
-        return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device)
+        if self.model_half:
+            return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device).half()
+        else: 
+            return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device)
     
     def reset_state(self):
         self.embedding_list = []
@@ -218,13 +241,14 @@ class translator:
                  src_vocab_size: int,
                  tgt_vocab_size: int,
                  hidden_size: int,
-                 device: str = "cuda",
+                 device: str,
                  num_encoder_layers: int = 1, 
                  num_decoder_layers: int = 1,
                  dropout_rate: float = 0.1,
                  max_len: int = 50,
                  sos_idx: int = 0,
-                 eos_idx: int = 1):
+                 eos_idx: int = 1,
+                 padding_idx: int = 2):
 
         self.device = device
         self.max_input_len = max_len
@@ -237,7 +261,8 @@ class translator:
             input_size=src_vocab_size,
             hidden_size=hidden_size,
             device=device,
-            num_encoder_layers=num_encoder_layers
+            num_encoder_layers=num_encoder_layers,
+            padding_index = padding_idx
         )
 
         self.decoder = AttnDecoderRNN(
@@ -245,11 +270,21 @@ class translator:
             output_size=tgt_vocab_size,
             device=device,
             num_decoder_layers=num_decoder_layers,
-            dropout_rate=dropout_rate
+            dropout_rate=dropout_rate,
+            padding_index = padding_idx
         )
 
         self.encoder.eval()
         self.decoder.eval()
+    
+    def to(self, device):
+        self.encoder.to(device)
+        self.decoder.to(device)
+        self.device = device
+        
+    def half(self):
+        self.encoder.half()
+        self.decoder.half()
 
 
     # 单句推理（greedy）
@@ -333,6 +368,8 @@ class translator:
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
         loss.backward()
+        nn_utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
+        nn_utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
         encoder_optimizer.step()
         decoder_optimizer.step()
 

@@ -184,7 +184,20 @@ class Lang:
             if tok in ("<SOS>", "<PAD>"):
                 continue
             words.append(tok)
-        return " ".join(words)        
+        return " ".join(words)
+    
+    def trim_topk(self, k: int):
+        # 保留频次最高的 k 个常用词 + 特殊符号
+        specials = ["<SOS>", "<EOS>", "<PAD>", "<UNK>"]
+
+        items = [(w, c) for w, c in self.word2count.items() if w not in specials]
+        items.sort(key=lambda x: x[1], reverse=True)
+        keep_words = specials + [w for w, _ in items[:k]]
+
+        # 重建映射
+        self.word2index = {w:i for i, w in enumerate(keep_words)}
+        self.index2word = {i:w for w, i in self.word2index.items()}
+        self.n_words = len(keep_words)        
             
 class dictionary:
     def __init__(self, name, lang1, lang2, save_dir="./Tokenizer"):
@@ -270,13 +283,14 @@ class dictionary:
             self.lang_class2.addSentence(tgt)
 
         print(" Counted words:")
-        if len(pairs) > 0:
-            sample_idx = random.randrange(len(pairs))  # 避免 randint 上界越界
-            print(f" Input language: {self.lang_class1.name}, {self.lang_class1.n_words} words, random sample: {pairs[sample_idx][0]}")
-            print(f" Output language: {self.lang_class2.name}, {self.lang_class2.n_words} words, random sample: {pairs[sample_idx][1]}")
-        else:
-            print(f" Input language: {self.lang_class1.name}, {self.lang_class1.n_words} words")
-            print(f" Output language: {self.lang_class2.name}, {self.lang_class2.n_words} words")
+        sample_idx = random.randrange(len(pairs))
+        print(f" Input language: {self.lang_class1.name}, {self.lang_class1.n_words} words, random sample: {pairs[sample_idx][0]}")
+        print(f" Output language: {self.lang_class2.name}, {self.lang_class2.n_words} words, random sample: {pairs[sample_idx][1]}")
+        topk=80000
+        self.lang_class1.trim_topk(topk)
+        self.lang_class2.trim_topk(topk)
+        print(f"Trimmed to {topk} words per language")
+
 
         # 7) 追加到总样本
         self.data_pairs.extend(pairs)
