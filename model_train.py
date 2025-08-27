@@ -10,6 +10,7 @@ from RNN_with_atten.NN import *
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import matplotlib.pyplot as plt
+from datasets import load_dataset
 
 
 # Warmup + CosinAnnealing
@@ -187,16 +188,15 @@ def train_iters(
 # Set device to CUDA if available, otherwise use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Use calculate device: ", device, "\n")
-MAX_LENGTH = 20 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
+MAX_LENGTH = 30 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
 print(f"Training data limit length (including punctuation marks): {MAX_LENGTH}")
 
-data_path = "./dataset/rus.txt"
+# data_path = "./dataset/rus.txt"
 eval_ratio = 0.15
 hidden_size = 1024
 batch_size = 512
 model_save_dir = "./temp_models"
-
-
+data = load_dataset("wmt14", "ru-en")
 
 if __name__ == "__main__":
     time_stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -204,7 +204,9 @@ if __name__ == "__main__":
     
     
     dict_obj = dictionary(name="en_rus", lang1="en", lang2="rus", save_dir=save_dir)
-    dict_obj.AddData(data_path, MAX_LENGTH=MAX_LENGTH, reverse=False)
+    
+    
+    dict_obj.AddData(data, MAX_LENGTH=MAX_LENGTH, reverse=False)
     dict_obj.save_tokenizer()
     
     # 这里的数据和Lang对象在训练正反翻译器的时候是可复用的，我们只实现一次dictionary类

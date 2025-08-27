@@ -7,6 +7,83 @@ import os
 from typing import List, Tuple, Dict
 import torch
 from torch.utils.data import TensorDataset, DataLoader
+import csv
+from typing import Any, Union
+
+
+def _iter_pairs_from_txt(path: str, encoding: str = "utf-8"):
+    """逐行读取 TSV（前两列） -> 产出 (src, tgt) 原始字符串对"""
+    with open(path, encoding=encoding) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            cols = line.split('\t')[0:2]
+            if len(cols) < 2:
+                continue
+            yield cols[0], cols[1]
+
+def _iter_pairs_from_csv(path: str,
+                         encoding: str = "utf-8",
+                         src_col: str = None,
+                         tgt_col: str = None):
+    """
+    读取 CSV -> 产出 (src, tgt)
+    - 若提供列名：用 DictReader 按列名取
+    - 否则：用 Reader 取前两列
+    """
+    with open(path, encoding=encoding, newline='') as f:
+        if src_col and tgt_col:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get(src_col) is None or row.get(tgt_col) is None:
+                    continue
+                yield row[src_col], row[tgt_col]
+        else:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                yield row[0], row[1]
+
+def _iter_pairs_from_hf(dataset_obj: Any,
+                        src_lang_key: str = "en",
+                        tgt_lang_key: str = "ru"):
+    """
+    解析 HuggingFace datasets:
+    - DatasetDict: 遍历每个 split
+    - Dataset: 直接遍历
+    """
+    try:
+        from datasets import Dataset, DatasetDict
+    except Exception:
+        Dataset = None
+        DatasetDict = None
+
+    def _yield_from_dataset(ds):
+        for ex in ds:
+            if "translation" in ex and isinstance(ex["translation"], dict):
+                trans = ex["translation"]
+                s = trans.get(src_lang_key, None)
+                t = trans.get(tgt_lang_key, None)
+            else:
+                s = ex.get(src_lang_key, None)
+                t = ex.get(tgt_lang_key, None)
+            if s is None or t is None:
+                continue
+            yield s, t
+
+    # DatasetDict
+    if DatasetDict is not None and isinstance(dataset_obj, DatasetDict):
+        for split_name, ds in dataset_obj.items():
+            for s, t in _yield_from_dataset(ds):
+                yield s, t
+        return
+    # Dataset
+    if Dataset is not None and isinstance(dataset_obj, Dataset):
+        for s, t in _yield_from_dataset(dataset_obj):
+            yield s, t
+        return
 
 # All kinds of spaces...
 spaces = [
@@ -118,33 +195,92 @@ class dictionary:
         self.save_dir = save_dir
         os.makedirs(self.save_dir, exist_ok=True)
         
-    def AddData(self, path, MAX_LENGTH, reverse=False):
-        
-        lines = open(path, encoding='utf-8').read().strip().split('\n')
+    def AddData(self,
+                source: Union[str, Any],
+                MAX_LENGTH: int,
+                reverse: bool = False,
+                *,
+                file_encoding: str = "utf-8",
+                csv_src_col: str = None,
+                csv_tgt_col: str = None,
+                hf_src_lang: str = "en",
+                hf_tgt_lang: str = "ru"):
+        """
+        通用数据导入：
+        - source 为 str:
+            * .txt/.tsv: 前两列
+            * .csv: 若给定 csv_src_col/csv_tgt_col 用列名，否则取前两列
+        - source 为 HuggingFace datasets 的 Dataset / DatasetDict：
+            * 优先使用 ex['translation'][hf_src_lang/hf_tgt_lang]
+            * 否则使用 ex[hf_src_lang], ex[hf_tgt_lang]
+        - 所有数据读入后混在一起；
+        For example:
+        1) TXT（制表符前两列）
+            dict_obj.AddData("./dataset/rus.txt", MAX_LENGTH=20, reverse=False)
+
+        2) CSV（指定列名；或省略列名用前两列）
+            dict_obj.AddData("./dataset/ru_en.csv", MAX_LENGTH=20, csv_src_col="en", csv_tgt_col="ru")
+
+        3) HuggingFace WMT
+            ds = load_dataset("wmt14", "ru-en")
+            dict_obj.AddData(ds, MAX_LENGTH=20)         # en->ru
+            dict_obj.AddData(ds, MAX_LENGTH=20, reverse=True)  # ru->en
+        """
+        print("Reading data ...")
+        raw_pairs = []
+
+        # 1) 文件路径
+        if isinstance(source, str):
+            path_lower = source.lower()
+            if path_lower.endswith(".csv"):
+                for s, t in _iter_pairs_from_csv(source, encoding=file_encoding,
+                                                 src_col=csv_src_col, tgt_col=csv_tgt_col):
+                    raw_pairs.append((s, t))
+            else:
+                # 默认按 txt/tsv 处理 -> 前两列 tab 分隔
+                for s, t in _iter_pairs_from_txt(source, encoding=file_encoding):
+                    raw_pairs.append((s, t))
+
+        else:
+            # 2) HuggingFace datasets 或其它可迭代对象
+            for s, t in _iter_pairs_from_hf(source, src_lang_key=hf_src_lang, tgt_lang_key=hf_tgt_lang):
+                raw_pairs.append((s, t))
+
+        print(f"Got {len(raw_pairs)} sentence pairs (raw)")
+
+        # 3) normalize
         pairs = []
-        print("Reading data file")
-        for l in lines:
-            sentences = l.split('\t')[0:2]
-            if len(sentences) < 2:
-                continue  
-            pairs.append([normalizeString(s) for s in sentences])
-            
-        print(f"Got {len(pairs)} sentence pairs")
+        for s, t in raw_pairs:
+            s_norm = normalizeString(s)
+            t_norm = normalizeString(t)
+            pairs.append([s_norm, t_norm])
+
+        # 4) 过滤长度（<= MAX_LENGTH）
         pairs = filterPairs(pairs, MAX_LENGTH)
-        print(f"Trimmed to {len(pairs)} sentence pairs")
+        print(f"Trimmed to {len(pairs)} sentence pairs (<= {MAX_LENGTH} tokens)")
+
+        # 5) reverse（如需）
         if reverse:
             pairs = [[p[1], p[0]] for p in pairs]
-        
-        
+
+        # 6) 统计并写入词表
         print(" Counting words...")
-        for pair in pairs:
-            self.lang_class1.addSentence(pair[0])
-            self.lang_class2.addSentence(pair[1])
-        print(" Counted words:\n")
-        sample = random.randint(0, len(pairs))
-        print(f"Input language:{self.lang_class1.name}, {self.lang_class1.n_words} words, random sample:{pairs[sample][0]}")
-        print(f"Input language:{self.lang_class2.name}, {self.lang_class2.n_words} words random sample:{pairs[sample][1]}")
+        for src, tgt in pairs:
+            self.lang_class1.addSentence(src)
+            self.lang_class2.addSentence(tgt)
+
+        print(" Counted words:")
+        if len(pairs) > 0:
+            sample_idx = random.randrange(len(pairs))  # 避免 randint 上界越界
+            print(f" Input language: {self.lang_class1.name}, {self.lang_class1.n_words} words, random sample: {pairs[sample_idx][0]}")
+            print(f" Output language: {self.lang_class2.name}, {self.lang_class2.n_words} words, random sample: {pairs[sample_idx][1]}")
+        else:
+            print(f" Input language: {self.lang_class1.name}, {self.lang_class1.n_words} words")
+            print(f" Output language: {self.lang_class2.name}, {self.lang_class2.n_words} words")
+
+        # 7) 追加到总样本
         self.data_pairs.extend(pairs)
+        print(f" Total pairs stored in dictionary: {len(self.data_pairs)}")
     
     def save_tokenizer(self):
         fp = os.path.join(self.save_dir, f"{self.name}.tokenizer.pkl")
