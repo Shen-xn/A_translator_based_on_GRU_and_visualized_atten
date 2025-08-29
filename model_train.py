@@ -240,7 +240,6 @@ if __name__ == "__main__":
             eos_idx=language2.word2index["<EOS>"],
             padding_idx=language2.word2index["<PAD>"])
     agent_f.to(device)
-    agent_f.half()
     
         # 正向 loaders（lang1 -> lang2）# Attention! Here load data on cpu to save cuda memory
     train_loaders_f = build_bucket_dataloaders(

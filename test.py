@@ -15,3 +15,4 @@ if torch.cuda.is_available():
     print("Test result on GPU:", torch.mm(x, y))
     
 print(torch.inf*0.0)
+print(torch.isfinite(None))

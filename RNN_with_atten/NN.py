@@ -49,15 +49,10 @@ class   EncoderRNN(nn.Module):
         self.fc = nn.Linear(hidden_size, hidden_size)
         
         self.to(self.device)
-        self.model_half = False
 
     def to(self, device):
         self.device = device
         return super().to(device)
-    
-    def half(self):
-        self.model_half=True
-        return super().half()
 
     # 定义向前传播
     def forward(self, input, hidden=None):
@@ -87,10 +82,7 @@ class   EncoderRNN(nn.Module):
         return output, hidden  # (seq_len, batch, input_size), （batch, hidden_size）
 
     def initHidden(self, batch_size=1):
-        if self.model_half:
-            return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device).half()
-        else:
-            return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device)
+        return torch.zeros(self.num_encoder_layers, batch_size, self.hidden_size, device=self.device)
     
 
 class Attention(nn.Module):
@@ -102,7 +94,7 @@ class Attention(nn.Module):
         self.Wv = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.ln = nn.LayerNorm(self.hidden_size)
         
-    def forward(self, input_matrix, query_seed_vector = None):
+    def forward(self, input_matrix, query_seed_vector = None):         
             # input_matrix: (T,B,H) -> (B,T,H)
             input_matrix = input_matrix.permute(1, 0, 2).contiguous()  # (B,T,H)
 
@@ -137,11 +129,9 @@ class Attention(nn.Module):
                     raise ValueError("query_seed_vector must be of shape (H,) or (B, H)")
 
                 Q_b1h = self.Wq(q_bh).unsqueeze(1)             # (B,1,H)
-
                 # scores: (B,1,T)
                 scores = torch.bmm(Q_b1h, K.transpose(1, 2)) * scale
                 atten = F.softmax(scores, dim=-1)                # (B,1,T)
-
                 # 输出: (B,1,H) -> (1,B,H)
                 out_b1h = torch.bmm(atten, V)                 # (B,1,H)
                 out_tbh = out_b1h.permute(1, 0, 2).contiguous() # (1,B,H)
@@ -180,15 +170,10 @@ class AttnDecoderRNN(nn.Module):
         self.out = nn.Linear(self.hidden_size, self.output_size)
         self.embedding_list = []
         self.to(self.device)
-        self.model_half=False
         
     def to(self, device):
         self.device = device
         return super().to(device)
-    
-    def half(self):
-        self.model_half=True
-        return super().half()
 
     def forward(self, input, encoder_output, hidden=None):
         batch_size = encoder_output.size(1)
@@ -228,10 +213,7 @@ class AttnDecoderRNN(nn.Module):
         
 
     def initHidden(self, batch_size=1):
-        if self.model_half:
-            return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device).half()
-        else: 
-            return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device)
+        return torch.zeros(self.num_decoder_layers, batch_size, self.hidden_size, device=self.device)
     
     def reset_state(self):
         self.embedding_list = []
@@ -282,10 +264,6 @@ class translator:
         self.encoder.to(device)
         self.decoder.to(device)
         self.device = device
-        
-    def half(self):
-        self.encoder.half()
-        self.decoder.half()
 
 
     # 单句推理（greedy）
@@ -371,10 +349,17 @@ class translator:
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
         loss.backward()
-        encoder_optimizer.step()
-        decoder_optimizer.step()
+        # check numerical stability
+        if torch.isnan(dec_out_collector).any() or torch.isnan(loss).any():
+            print(f"length: {tgt_TB.size(0)}")
+            print(f"dec_out: {dec_out_collector}")
+            print(target)
+            raise ValueError("exploed")
         nn_utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
         nn_utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
+        encoder_optimizer.step()
+        decoder_optimizer.step()
+
         # 返回时序平均损失
         return loss.item()
 
