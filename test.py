@@ -13,3 +13,5 @@ if torch.cuda.is_available():
     x = torch.rand(3, 3).cuda()
     y = torch.rand(3, 3).cuda()
     print("Test result on GPU:", torch.mm(x, y))
+    
+print(torch.inf*0.0)

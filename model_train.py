@@ -11,6 +11,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 import matplotlib.pyplot as plt
 from datasets import load_dataset
+from APP import _load_tokenizer_pkl
 
 # Warmup + CosinAnnealing
 def build_cosine_with_warmup(optimizer, total_steps, warmup_ratio=0.1, min_lr_scale=0.2):
@@ -54,11 +55,12 @@ def train_iters(
     weight_decay=0.01,
     warmup_ratio=0.1,
     print_every=50,     
-    val_every=500,  
+    val_every=500,
+    pad_tgt=2  
 ):
     os.makedirs(model_save_dir, exist_ok=True)
-    enc_opt = AdamW(agent.encoder.parameters(), lr=lr, weight_decay=weight_decay)
-    dec_opt = AdamW(agent.decoder.parameters(), lr=lr, weight_decay=weight_decay)
+    enc_opt = torch.optim.AdamW(agent.encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    dec_opt = torch.optim.AdamW(agent.decoder.parameters(), lr=lr, weight_decay=weight_decay)
 
     # 遍历一次 loader 统计 batch 数
     total_train_steps = 0
@@ -68,9 +70,7 @@ def train_iters(
     total_train_steps *= epochs # maximum total train steps
     enc_sch = build_cosine_with_warmup(enc_opt, total_steps=total_train_steps, warmup_ratio=warmup_ratio)
     dec_sch = build_cosine_with_warmup(dec_opt, total_steps=total_train_steps, warmup_ratio=warmup_ratio)
-
-    pad_tgt = 2
-    criterion = nn.CrossEntropyLoss(ignore_index=pad_tgt)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_tgt, reduction="mean")
     """
     正确类的概率 = 1 - ε（例如 0.9,当 ε=0.1 时）
     其他类的概率 = ε / (num_classes - 1)（平均分配)
@@ -108,7 +108,6 @@ def train_iters(
             src_batch = src_batch.to(device)
             tgt_batch = tgt_batch.to(device)
             loss = agent.train_on_batch(src_batch, tgt_batch, enc_opt, dec_opt, criterion, teacher_forcing_ratio=0.5)
-
             # === scheduler 跟进一步 ===
             enc_sch.step()
             dec_sch.step()
@@ -193,13 +192,13 @@ def train_iters(
 # Set device to CUDA if available, otherwise use CPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Use calculate device: ", device, "\n")
-MAX_LENGTH = 20 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
+MAX_LENGTH = 16 # This is maxlength of sentence! NOT INCLUDING EOS SOS...
 print(f"Training data limit length (including punctuation marks): {MAX_LENGTH}")
 
 data_path = "./dataset/rus.txt"
 eval_ratio = 0.15
-hidden_size = 1024
-batch_size = 512
+hidden_size = 512
+batch_size = 256
 model_save_dir = "./temp_models"
 data = load_dataset("wmt14", "ru-en")
 
@@ -211,7 +210,7 @@ if __name__ == "__main__":
     dict_obj = dictionary(name="en_rus", lang1="en", lang2="rus", save_dir=save_dir)
     
     
-    dict_obj.AddData(data, MAX_LENGTH=MAX_LENGTH, reverse=False)
+    dict_obj.AddData(data_path, MAX_LENGTH=MAX_LENGTH, reverse=False)
     dict_obj.save_tokenizer()
     
     
@@ -241,23 +240,9 @@ if __name__ == "__main__":
             eos_idx=language2.word2index["<EOS>"],
             padding_idx=language2.word2index["<PAD>"])
     agent_f.to(device)
+    agent_f.half()
     
-    # agent_b = translator(
-    #             src_vocab_size=vocab_size2,
-    #             tgt_vocab_size=vocab_size1,
-    #             hidden_size=hidden_size,
-    #             device="cuda",
-    #             num_encoder_layers=2, 
-    #             num_decoder_layers=1,
-    #             dropout_rate= 0.1,
-    #             sos_idx=language2.word2index["SOS"],
-    #             eos_idx=language1.word2index["EOS"])
-    
-
-    
-    
-    
-    # 正向 loaders（lang1 -> lang2）# Attention! Here load data on cpu to save cuda memory
+        # 正向 loaders（lang1 -> lang2）# Attention! Here load data on cpu to save cuda memory
     train_loaders_f = build_bucket_dataloaders(
         train_pairs, language1, language2, MAX_LENGTH_no_specials=MAX_LENGTH,
         include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},
@@ -268,20 +253,7 @@ if __name__ == "__main__":
         include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},  # eval可更大
         shuffle=False, pin_memory=(device.type=="cpu")
     )
-
-    # # 3) 反向 loaders（lang2 -> lang1），同一套字典可直接用
-    # train_loaders_b = build_bucket_dataloaders(
-    #     [(t,s) for (s,t) in train_pairs], language2, language1, MAX_LENGTH_no_specials=MAX_LENGTH,
-    #     include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},
-    #     shuffle=True, pin_memory=(device.type=="cuda")
-    # )
-    # eval_loaders_b = build_bucket_dataloaders(
-    #     [(t,s) for (s,t) in eval_pairs], language2, language1, MAX_LENGTH_no_specials=MAX_LENGTH,
-    #     include_sos=False, batch_sizes={"q1":batch_size//4,"q2":batch_size//4,"q3":batch_size//4,"q4":batch_size//4},
-    #     shuffle=False, pin_memory=(device.type=="cuda")
-    # )
-                     
-   
+      
     history, run_dir = train_iters(
         agent=agent_f,
         train_loaders=train_loaders_f,
@@ -289,11 +261,11 @@ if __name__ == "__main__":
         # upper three need change direction!!
         device=device,
         epochs=8,
-        lr=3e-4,
-        weight_decay=0.01,
+        lr=0.0,
+        weight_decay=0.001,
         warmup_ratio=0.1,
         print_every=100,
         val_every=1000,
-        model_save_dir=save_dir
+        model_save_dir=save_dir,
+        pad_tgt=language2.word2index["<PAD>"]
     )
-    

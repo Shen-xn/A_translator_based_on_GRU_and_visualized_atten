@@ -100,6 +100,7 @@ class Attention(nn.Module):
         self.Wq = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.Wk = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.Wv = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.ln = nn.LayerNorm(self.hidden_size)
         
     def forward(self, input_matrix, query_seed_vector = None):
             # input_matrix: (T,B,H) -> (B,T,H)
@@ -122,6 +123,8 @@ class Attention(nn.Module):
                 #(B,T,H) -> (T,B,H)
                 out_bt = torch.bmm(atten, V)                 # (B,T,H)
                 out_tb = out_bt.permute(1, 0, 2).contiguous()  # (T,B,H)
+                out_tb = self.ln(input_matrix + out_tb)
+                
                 return out_tb, atten
 
             else:
@@ -142,7 +145,7 @@ class Attention(nn.Module):
                 # 输出: (B,1,H) -> (1,B,H)
                 out_b1h = torch.bmm(atten, V)                 # (B,1,H)
                 out_tbh = out_b1h.permute(1, 0, 2).contiguous() # (1,B,H)
-                
+                out_tbh = self.ln(query_seed_vector + out_tbh)
                 return out_tbh, atten
     
 
@@ -174,7 +177,6 @@ class AttnDecoderRNN(nn.Module):
         self.dropout = nn.Dropout(self.dropout_rate)
         self.grus = nn.ModuleList([Norm_GRU(self.hidden_size) for _ in range(self.num_decoder_layers)])
         self.ln_embedding = nn.LayerNorm(self.hidden_size)
-        self.ln_out =  nn.LayerNorm(self.hidden_size)
         self.out = nn.Linear(self.hidden_size, self.output_size)
         self.embedding_list = []
         self.to(self.device)
@@ -222,7 +224,6 @@ class AttnDecoderRNN(nn.Module):
         hidden = torch.cat(new_h_list, dim=0)  
         output = self.dropout(x)  # (1, batch，hidden_size)
         output = self.out(output)  # -> (1, batch，hidden_size)
-
         return output, hidden, attn_emb, attn_enc
         
 
@@ -349,32 +350,33 @@ class translator:
         dec_input = torch.full((B, 1), self.sos_idx, device=device, dtype=torch.long) # (L,B,1)
 
         use_teacher_forcing = torch.rand(1).item() < teacher_forcing_ratio
-        tgt_TB = target_tensor.to(device).t()   # (T_out, B)
-
-        loss = 0.0
+        tgt_TB = target_tensor.to(device).t()   # (T_out, B)   
+        dec_out_collector = []
         for t in range(tgt_TB.size(0)):
             target_word = tgt_TB[t].unsqueeze(1)                                  # (B,1)
 
             dec_out, dec_hidden, _, _ = self.decoder(dec_input, enc_out, dec_hidden)  # dec_out:(1,B,V)
-            # dec_out.squeeze(0)->(B,V)
-            loss = loss + criterion(dec_out.squeeze(0), target_word.squeeze(1))
+            dec_out_collector.append(dec_out[0])
+            # if not torch.isfinite(loss):
+            #     raise ValueError("exploed")
 
             if use_teacher_forcing:
                 dec_input = target_word                                           # Teacher forcing
             else:
                 topv, topi = dec_out.topk(1, dim=2)                               # (1,B,1)
                 dec_input = topi.squeeze(0).detach()                              # (B,1)
-
+        dec_out_collector = torch.cat(dec_out_collector) # [T*B, V]
+        target = tgt_TB.reshape(-1) # [T*B]
+        loss = criterion(dec_out_collector, target)
         encoder_optimizer.zero_grad()
         decoder_optimizer.zero_grad()
         loss.backward()
-        nn_utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
-        nn_utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
         encoder_optimizer.step()
         decoder_optimizer.step()
-
+        nn_utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
+        nn_utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
         # 返回时序平均损失
-        return loss.item() / tgt_TB.size(0)
+        return loss.item()
 
     # 批量评估（greedy 生成）
         # 输入: (B, T_in) LongTensor（已 padding）
@@ -399,19 +401,20 @@ class translator:
         dec_hidden = None                                                   # (L,B,H)
         dec_input = torch.full((B, 1), self.sos_idx, device=device, dtype=torch.long) # (L,B,1)
         tgt_TB = target_tensor.to(device).t()   # (T_out, B)
-
-        loss = 0.0
-        for t in range(tgt_TB.size(0)):
-            target_word = tgt_TB[t].unsqueeze(1)                                  # (B,1)
-
+        dec_out_collector = []
+        for t in range(tgt_TB.size(0)):            
             dec_out, dec_hidden, _, _ = self.decoder(dec_input, enc_out, dec_hidden)  # dec_out:(1,B,V)
+            dec_out_collector.append(dec_out[0])
+            
             # dec_out.squeeze(0)->(B,V)
-            loss = loss + criterion(dec_out.squeeze(0), target_word.squeeze(1))
             _, topi = dec_out.topk(1, dim=2)                               # (1,B,1)
             dec_input = topi.squeeze(0).detach()                              # (B,1)
-
+            
+        dec_out_collector = torch.cat(dec_out_collector) # [T*B, V]
+        target = tgt_TB.reshape(-1) # [T*B]
+        loss = criterion(dec_out_collector, target)
         # 返回时序平均损失
-        return loss.item() / tgt_TB.size(0)
+        return loss.item()
     
 
     # 保存 / 加载
